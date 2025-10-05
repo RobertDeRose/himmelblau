@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<parameter name="enroll_device"
+           section="global"
+           type="bool"
+           rust_type="bool"
+           documented="true"
+           domain_specific="false"
+           order="3150">
+<description>
+A boolean option that enables host/device enrollment in Microsoft Intune when required by policy or during Hello PIN enrollment flows.
+Setting this to false disables automatic device enrollment; Intune-related enrollment and key insertion operations are skipped when disabled.
+Disabling enrollment also disables Linux Hello enrollment because Hello credentials require device enrollment.
+</description>
+<conf_description>Enroll this host/device in Microsoft Intune when required.</conf_description>
+<default>true</default>
+<example>enroll_device = true</example>
+</parameter>

@@ -606,6 +606,32 @@ Default: true
 Example: apply_policy = false
 
 .TP
+.B enroll_device
+.RE
+A boolean option that enables host/device enrollment in Microsoft Intune when required by policy or during Hello PIN enrollment flows.
+Setting this to false disables automatic device enrollment; Intune-related enrollment and key insertion operations are skipped when disabled.
+Disabling enrollment also disables Linux Hello enrollment because Hello credentials require device enrollment.
+
+.P
+Default: true
+
+.P
+Example: enroll_device = true
+
+.TP
+.B enable_experimental_intune_custom_compliance
+.RE
+A boolean option that enables support for Linux Intune Custom Compliance policies.
+This feature is experimental and not yet fully functional. While policy settings should be applied locally, the compliance status is not reliably reported to Intune, and failed policies do not currently block authentication.
+This option requires apply_policy = true.
+
+.P
+Default: false
+
+.P
+Example: enable_experimental_intune_custom_compliance = true
+
+.TP
 .B authority_host
 .RE
 Specifies the hostname for Microsoft authentication.

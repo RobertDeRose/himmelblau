@@ -23,9 +23,9 @@ use crate::auth_handle_mfa_resp;
 use crate::config::split_username;
 use crate::config::HimmelblauConfig;
 use crate::config::IdAttr;
-use crate::constants::DEFAULT_APP_ID;
 use crate::constants::EDGE_BROWSER_CLIENT_ID;
 use crate::constants::ID_MAP_CACHE;
+use crate::constants::{DEFAULT_APP_ID, DEFAULT_GRAPH};
 use crate::db::KeyStoreTxn;
 use crate::idmap_cache::StaticIdCache;
 use crate::idprovider::common::build_online_probe_client;
@@ -922,6 +922,20 @@ impl HimmelblauProvider {
         self.refresh_cache.import_broker_prts(data).await
     }
 
+    async fn new_public_client(&self) -> Result<PublicClientApplication, MsalError> {
+        let (ip_versions, request_timeout) = {
+            let cfg = self.config.lock().await;
+            (cfg.get_ip_versions(), cfg.get_request_timeout())
+        };
+
+        PublicClientApplication::new(
+            BROKER_APP_ID,
+            None,
+            Duration::from_secs(request_timeout),
+            &ip_versions,
+        )
+    }
+
     /// Initiate MFA flow with automatic fallback if the requested method is unavailable.
     /// If a specific MFA method is requested but not available, this will automatically
     /// retry with no method specified (allowing Azure to choose the default).
@@ -933,18 +947,33 @@ impl HimmelblauProvider {
         auth_init: Option<himmelblau::auth::AuthInit>,
         mfa_method: Option<String>,
     ) -> Result<himmelblau::auth::MFAAuthContinue, MsalError> {
-        let result = self
-            .client
-            .lock()
-            .await
-            .initiate_acquire_token_by_mfa_flow_for_device_enrollment(
-                account_id,
-                password,
-                auth_options,
-                auth_init.clone(),
-                mfa_method.as_deref(),
-            )
-            .await;
+        let enroll_device_enabled = self.config.lock().await.get_enroll_device();
+        let result = if enroll_device_enabled {
+            self.client
+                .lock()
+                .await
+                .initiate_acquire_token_by_mfa_flow_for_device_enrollment(
+                    account_id,
+                    password,
+                    auth_options,
+                    auth_init.clone(),
+                    mfa_method.as_deref(),
+                )
+                .await
+        } else {
+            self.new_public_client()
+                .await?
+                .initiate_acquire_token_by_mfa_flow(
+                    account_id,
+                    password,
+                    vec![],
+                    Some(DEFAULT_GRAPH),
+                    auth_options,
+                    auth_init.clone(),
+                    mfa_method.as_deref(),
+                )
+                .await
+        };
 
         match result {
             Ok(flow) => Ok(flow),
@@ -956,17 +985,32 @@ impl HimmelblauProvider {
             {
                 // Requested MFA method not available, fall back to default
                 warn!("{} Retrying with default MFA method.", msg);
-                self.client
-                    .lock()
-                    .await
-                    .initiate_acquire_token_by_mfa_flow_for_device_enrollment(
-                        account_id,
-                        password,
-                        auth_options,
-                        auth_init,
-                        None, // Retry without specifying MFA method
-                    )
-                    .await
+                if enroll_device_enabled {
+                    self.client
+                        .lock()
+                        .await
+                        .initiate_acquire_token_by_mfa_flow_for_device_enrollment(
+                            account_id,
+                            password,
+                            auth_options,
+                            auth_init,
+                            None, // Retry without specifying MFA method
+                        )
+                        .await
+                } else {
+                    self.new_public_client()
+                        .await?
+                        .initiate_acquire_token_by_mfa_flow(
+                            account_id,
+                            password,
+                            vec![],
+                            Some(DEFAULT_GRAPH),
+                            auth_options,
+                            auth_init,
+                            None, // Retry without specifying MFA method
+                        )
+                        .await
+                }
             }
             Err(e) => Err(e),
         }
@@ -1780,15 +1824,24 @@ impl IdProvider for HimmelblauProvider {
             }
         }
 
-        let hello_key = match self.fetch_hello_key(account_id, keystore) {
-            Ok((hello_key, _keytype)) => Some(hello_key),
-            Err(_) => None,
+        let (
+            remote_services,
+            allow_remote_hello,
+            hello_pin_retry_count,
+            enroll_device_enabled,
+            enable_hello,
+            apply_policy,
+        ) = {
+            let cfg = self.config.lock().await;
+            (
+                cfg.get_password_only_remote_services_deny_list(),
+                cfg.get_allow_remote_hello(),
+                cfg.get_hello_pin_retry_count(),
+                cfg.get_enroll_device(),
+                cfg.get_enable_hello(),
+                cfg.get_apply_policy(),
+            )
         };
-        let remote_services = self
-            .config
-            .lock()
-            .await
-            .get_password_only_remote_services_deny_list();
         // Check if this is a remote service:
         // - Service starts with "remote:" (set by PAM module when PAM_RHOST is set)
         // - Service name contains any entry from remote_services_deny_list
@@ -1797,12 +1850,18 @@ impl IdProvider for HimmelblauProvider {
                 .iter()
                 .any(|s| !s.is_empty() && service.contains(s));
         let hello_totp_enabled = check_hello_totp_enabled!(self);
-        let allow_remote_hello = self.config.lock().await.get_allow_remote_hello();
-        // Skip Hello authentication if it is disabled by config
-        let hello_enabled = self.config.lock().await.get_enable_hello();
-        let hello_pin_retry_count = self.config.lock().await.get_hello_pin_retry_count();
+        // Skip Hello authentication if it is disabled by config or device enrollment is disabled.
+        let hello_enabled = enroll_device_enabled && enable_hello;
         let intune_enrollment_required =
-            self.config.lock().await.get_apply_policy() && !self.is_intune_enrolled(keystore).await;
+            enroll_device_enabled && apply_policy && !self.is_intune_enrolled(keystore).await;
+        let hello_key = if hello_enabled {
+            match self.fetch_hello_key(account_id, keystore) {
+                Ok((hello_key, _keytype)) => Some(hello_key),
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
         if !self.is_domain_joined(keystore).await
             || hello_key.is_none()
             || !hello_enabled
@@ -1915,13 +1974,13 @@ impl IdProvider for HimmelblauProvider {
                     let mfa_method = self.config.lock().await.get_mfa_method();
                     let flow = net_down_check!(
                         self.initiate_mfa_flow_with_fallback(
-                                account_id,
-                                None,
-                                &auth_options,
-                                Some(auth_init),
-                                mfa_method
-                            )
-                            .await,
+                            account_id,
+                            None,
+                            &auth_options,
+                            Some(auth_init),
+                            mfa_method,
+                        )
+                        .await,
                         Err(MsalError::PasswordRequired) => {
                             return Ok((AuthRequest::Password, AuthCredHandler::None));
                         },
@@ -1976,18 +2035,39 @@ impl IdProvider for HimmelblauProvider {
                 if is_remote_service {
                     auth_options.push(AuthOption::RemoteSession);
                 }
-                let resp = net_down_check!(
+                let result = if enroll_device_enabled {
                     self.client
                         .lock()
                         .await
                         .initiate_device_flow_for_device_enrollment(&auth_options)
-                        .await,
+                        .await
+                        .map(Into::into)
+                } else {
+                    match self.new_public_client().await {
+                        Ok(client) => {
+                            client
+                                .initiate_acquire_token_by_mfa_flow(
+                                    account_id,
+                                    None,
+                                    vec![],
+                                    Some(DEFAULT_GRAPH),
+                                    &auth_options,
+                                    None,
+                                    None,
+                                )
+                                .await
+                        }
+                        Err(e) => Err(e),
+                    }
+                };
+                let resp = net_down_check!(
+                    result,
                     Err(e) => {
                         error!("{:?}", e);
                         return Err(IdpError::BadRequest);
                     }
                 );
-                let flow: MFAAuthContinue = resp.into();
+                let flow = resp;
                 let msg = flow.msg.clone();
                 let polling_interval = flow.polling_interval.unwrap_or(5000);
                 Ok((
@@ -2073,6 +2153,14 @@ impl IdProvider for HimmelblauProvider {
                 AuthCacheAction::None,
             ));
         }
+        let (enroll_device_enabled, hello_enabled) = {
+            let cfg = self.config.lock().await;
+            let enroll_device_enabled = cfg.get_enroll_device();
+            (
+                enroll_device_enabled,
+                enroll_device_enabled && cfg.get_enable_hello(),
+            )
+        };
 
         macro_rules! intune_enroll {
             ($token:ident) => {
@@ -3208,7 +3296,7 @@ impl IdProvider for HimmelblauProvider {
                         })?;
                 }
 
-                if !self.is_intune_enrolled(keystore).await {
+                if enroll_device_enabled && !self.is_intune_enrolled(keystore).await {
                     intune_enroll!(token);
                 }
 
@@ -3376,7 +3464,7 @@ impl IdProvider for HimmelblauProvider {
         macro_rules! maybe_prompt_setup_pin_after_password_only_success {
             ($enrollment_token:expr, $success_token:expr, $action:expr, $msg:expr) => {{
                 let action = $action;
-                let hello_enabled = self.config.lock().await.get_enable_hello();
+                let hello_enabled = hello_enabled;
                 let hello_key_missing = self.fetch_hello_key(account_id, keystore).is_err();
                 if hello_enabled && !no_hello_pin && hello_key_missing {
                     info!($msg);
@@ -3596,7 +3684,11 @@ impl IdProvider for HimmelblauProvider {
                     Some(Ok(token)) => {
                         // Password validated and no MFA required - return success
                         debug!("ROPC succeeded - no MFA required");
-                        let token2 = enroll_and_obtain_enrolled_token!(token, Some(cred.clone()));
+                        let token2 = if enroll_device_enabled {
+                            enroll_and_obtain_enrolled_token!(token, Some(cred.clone()))
+                        } else {
+                            token.clone()
+                        };
                         return match self.token_validate(account_id, &token2, None).await {
                             Ok(AuthResult::Success { token }) => {
                                 let action =
@@ -3907,7 +3999,11 @@ impl IdProvider for HimmelblauProvider {
                                 return Ok((AuthResult::Denied(msal_error_to_user_message(&e)), AuthCacheAction::None));
                             }
                         };
-                        let token2 = enroll_and_obtain_enrolled_token!(token, Some(cred.clone()));
+                        let token2 = if enroll_device_enabled {
+                            enroll_and_obtain_enrolled_token!(token, Some(cred.clone()))
+                        } else {
+                            token.clone()
+                        };
                         return match self.token_validate(account_id, &token2, None).await {
                             Ok(AuthResult::Success { token }) => {
                                 // STOP! If we just enrolled with an SFA token, then we
@@ -3969,7 +4065,11 @@ impl IdProvider for HimmelblauProvider {
                         }
                     }
                 );
-                let token2 = enroll_and_obtain_enrolled_token!(token, password.clone());
+                let token2 = if enroll_device_enabled {
+                    enroll_and_obtain_enrolled_token!(token, password.clone())
+                } else {
+                    token.clone()
+                };
                 match self.token_validate(account_id, &token2, None).await {
                     Ok(AuthResult::Success { token: token3 }) => {
                         reseal_prt_with_existing_hello_key_on_success!(
@@ -3978,8 +4078,7 @@ impl IdProvider for HimmelblauProvider {
                             token3
                         );
 
-                        // Skip Hello enrollment if it is disabled by config
-                        let hello_enabled = self.config.lock().await.get_enable_hello();
+                        // Skip Hello enrollment if it is disabled by config or device enrollment is disabled
                         if !hello_enabled || no_hello_pin {
                             info!("Skipping Hello enrollment because it is disabled");
                             return Ok((
@@ -4086,8 +4185,8 @@ impl IdProvider for HimmelblauProvider {
                         }
                     }
                 );
-                // Check whether the token is a for the special MSA tenant,
-                // meaning we need skip device enrollment (it's a personal
+                // Check whether the token is for the special MSA tenant,
+                // meaning we need to skip device enrollment (it's a personal
                 // account).
                 let msa_tenant = token.tenant_id().map_err(|e| {
                     error!("{:?}", e);
@@ -4096,7 +4195,7 @@ impl IdProvider for HimmelblauProvider {
                         where_: "unix_user_online_auth_step".to_string(),
                     }
                 })? == "9188040d-6c67-4c5b-b112-36a304b66dad";
-                let token2 = if msa_tenant {
+                let token2 = if !enroll_device_enabled || msa_tenant {
                     token.clone()
                 } else {
                     enroll_and_obtain_enrolled_token!(token, password.clone())
@@ -4109,8 +4208,7 @@ impl IdProvider for HimmelblauProvider {
                             token3
                         );
 
-                        // Skip Hello enrollment if it is disabled by config
-                        let hello_enabled = self.config.lock().await.get_enable_hello();
+                        // Skip Hello enrollment if it is disabled by config or device enrollment is disabled
                         if !hello_enabled || no_hello_pin {
                             info!("Skipping Hello enrollment because it is disabled");
                             return Ok((
@@ -4198,7 +4296,11 @@ impl IdProvider for HimmelblauProvider {
                         }
                     }
                 );
-                let token2 = enroll_and_obtain_enrolled_token!(token, password.clone());
+                let token2 = if enroll_device_enabled {
+                    enroll_and_obtain_enrolled_token!(token, password.clone())
+                } else {
+                    token.clone()
+                };
                 match self.token_validate(account_id, &token2, None).await {
                     Ok(AuthResult::Success { token: token3 }) => {
                         reseal_prt_with_existing_hello_key_on_success!(
@@ -4207,8 +4309,7 @@ impl IdProvider for HimmelblauProvider {
                             token3
                         );
 
-                        // Skip Hello enrollment if it is disabled by config
-                        let hello_enabled = self.config.lock().await.get_enable_hello();
+                        // Skip Hello enrollment if it is disabled by config or device enrollment is disabled
                         if !hello_enabled || no_hello_pin {
                             info!("Skipping Hello enrollment because it is disabled");
                             return Ok((

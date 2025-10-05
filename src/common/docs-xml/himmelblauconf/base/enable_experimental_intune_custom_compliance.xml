@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<parameter name="enable_experimental_intune_custom_compliance"
+           section="global"
+           type="bool"
+           rust_type="bool"
+           documented="true"
+           domain_specific="false"
+           order="3175">
+<description>
+A boolean option that enables support for Linux Intune Custom Compliance policies.
+This feature is experimental and not yet fully functional. While policy settings should be applied locally, the compliance status is not reliably reported to Intune, and failed policies do not currently block authentication.
+This option requires apply_policy = true.
+</description>
+<conf_description>Enable experimental Linux Intune Custom Compliance policy support.</conf_description>
+<default>false</default>
+<example>enable_experimental_intune_custom_compliance = true</example>
+</parameter>
